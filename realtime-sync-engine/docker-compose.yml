@@ -1,0 +1,85 @@
+# Real-Time Sync Engine: local stack.
+#   postgres   PostgreSQL 16 (source of truth)
+#   redis      Redis 7 (Channels pub/sub layer)
+#   backend    Django + Channels on :8000   (seeds demo data)
+#   backend-b  a second, independent server process on :8001, to prove
+#              cross-process fan-out through Redis
+#   frontend   Vite dev server on :5173 (proxies /api and /ws to backend)
+
+x-backend: &backend
+  build: ./backend
+  environment: &backend-env
+    DJANGO_SETTINGS_MODULE: ${DJANGO_SETTINGS_MODULE:-config.settings.dev}
+    POSTGRES_HOST: postgres
+    POSTGRES_DB: sync_engine
+    POSTGRES_USER: sync
+    POSTGRES_PASSWORD: sync
+    REDIS_URL: redis://redis:6379/0
+    SYNC_DB_THREAD_SENSITIVE: ${SYNC_DB_THREAD_SENSITIVE:-1}
+  depends_on:
+    postgres: { condition: service_healthy }
+    redis: { condition: service_healthy }
+  volumes:
+    - ./backend:/app
+    - ./benchmarks:/benchmarks
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: sync_engine
+      POSTGRES_USER: sync
+      POSTGRES_PASSWORD: sync
+    ports: ["5432:5432"]
+    volumes: [pgdata:/var/lib/postgresql/data]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U sync -d sync_engine"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
+    ports: ["6379:6379"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  backend:
+    <<: *backend
+    environment:
+      <<: *backend-env
+      SEED_DEMO: "1"
+    ports: ["8000:8000"]
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/api/health/', timeout=2)"]
+      interval: 3s
+      timeout: 3s
+      retries: 40
+      start_period: 5s
+
+  backend-b:
+    <<: *backend
+    environment:
+      <<: *backend-env
+      RUN_MIGRATIONS: "0"
+    depends_on:
+      backend: { condition: service_healthy }
+      postgres: { condition: service_healthy }
+      redis: { condition: service_healthy }
+    ports: ["8001:8000"]
+
+  frontend:
+    build: ./frontend
+    environment:
+      BACKEND_URL: http://backend:8000
+    ports: ["5173:5173"]
+    volumes:
+      - ./frontend/src:/app/src
+    depends_on: [backend]
+
+volumes:
+  pgdata:
